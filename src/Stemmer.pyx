@@ -1,3 +1,4 @@
+# cython: freethreading_compatible = True
 # Stemmer.pyx: Copyright (c) 2006, Richard Boulton
 # Pyrex interface to the snowball "libstemmer_c" library.
 #
@@ -23,6 +24,8 @@ r"""Stemmer: stemming algorithms from the snowball project.
 
 """
 __docformat__ = "restructuredtext en"
+
+from threading import RLock
 
 cdef extern from *:
     ctypedef char** const_char_ptr_ptr "const char **"
@@ -81,8 +84,8 @@ def version():
 cdef class Stemmer:
     """An instance of a stemming algorithm.
 
-    The algorithm has internal state, so must not be called concurrently.
-    ie, only a single thread should access the instance at any given time.
+    Instances can be shared between threads.  Access to the internal state
+    and cache is serialized; use separate instances for parallel stemming.
 
     When creating a `Stemmer` object, there is one required argument: the
     name of the algorithm to use in the new stemmer.  A list of the valid
@@ -110,6 +113,10 @@ cdef class Stemmer:
     cdef object cache
     cdef object counter
     cdef int max_cache_size
+    cdef object _lock
+
+    def __cinit__(self):
+        self._lock = RLock()
 
     def __init__ (self, algorithm, int maxCacheSize = 10000):
         """Initialise a stemmer.
@@ -117,13 +124,17 @@ cdef class Stemmer:
         See the class documentation for details.
 
         """
+        cdef sb_stemmer * new_cobj
         alg = algorithm.encode(u'ascii')
-        self.cobj = sb_stemmer_new(alg, 'UTF_8')
-        if self.cobj == NULL:
-            raise KeyError("Stemming algorithm '%s' not found" % algorithm)
-        self.max_cache_size = maxCacheSize
-        self.counter = 0
-        self.cache = {}
+        with self._lock:
+            new_cobj = sb_stemmer_new(alg, 'UTF_8')
+            if new_cobj == NULL:
+                raise KeyError("Stemming algorithm '%s' not found" % algorithm)
+            sb_stemmer_delete(self.cobj)
+            self.cobj = new_cobj
+            self.max_cache_size = maxCacheSize
+            self.counter = 0
+            self.cache = {}
 
     def __dealloc__ (self):
         sb_stemmer_delete(self.cobj)
@@ -139,24 +150,27 @@ cdef class Stemmer:
 
         """
         def __set__(self, int size):
-            self.max_cache_size = size
-            if size == 0:
-                self.cache = {}
-                self.counter = 0
-            else:
-                self.__purgeCache()
+            with self._lock:
+                self.max_cache_size = size
+                if size == 0:
+                    self.cache = {}
+                    self.counter = 0
+                else:
+                    self.__purgeCache()
         def __get__(self):
-            return self.max_cache_size
+            with self._lock:
+                return self.max_cache_size
 
     def __purgeCache (self):
-        if len(self.cache) < self.max_cache_size:
-            return
-        newcache = {}
-        mincounter = self.counter - int(self.max_cache_size * 8 / 10)
-        for (word, cacheditem) in self.cache.iteritems():
-            if cacheditem[1] > mincounter:
-                newcache[word] = cacheditem
-        self.cache = newcache
+        with self._lock:
+            if len(self.cache) < self.max_cache_size:
+                return
+            newcache = {}
+            mincounter = self.counter - int(self.max_cache_size * 8 / 10)
+            for (word, cacheditem) in self.cache.iteritems():
+                if cacheditem[1] > mincounter:
+                    newcache[word] = cacheditem
+            self.cache = newcache
 
     def stemWord (self, word):
         """Stem a word.
@@ -176,25 +190,26 @@ cdef class Stemmer:
             was_unicode = 1
             word = word.encode(u'utf-8');
 
-        if self.max_cache_size > 0:
-            try:
-                cacheditem = self.cache[word]
-                result = cacheditem[0]
-                cacheditem[1] = self.counter
-                self.counter = self.counter + 1
-            except KeyError:
+        with self._lock:
+            if self.max_cache_size > 0:
+                try:
+                    cacheditem = self.cache[word]
+                    result = cacheditem[0]
+                    cacheditem[1] = self.counter
+                    self.counter = self.counter + 1
+                except KeyError:
+                    c_word = word
+                    c_word = <const char*>sb_stemmer_stem(self.cobj, <const sb_symbol*>c_word, len(word))
+                    length = sb_stemmer_length(self.cobj)
+                    result = PyUnicode_FromStringAndSize (c_word, length)
+                    self.cache[word] = [result, self.counter]
+                    self.counter = self.counter + 1
+                    self.__purgeCache()
+            else:
                 c_word = word
                 c_word = <const char*>sb_stemmer_stem(self.cobj, <const sb_symbol*>c_word, len(word))
                 length = sb_stemmer_length(self.cobj)
                 result = PyUnicode_FromStringAndSize (c_word, length)
-                self.cache[word] = [result, self.counter]
-                self.counter = self.counter + 1
-                self.__purgeCache()
-        else:
-            c_word = word
-            c_word = <const char*>sb_stemmer_stem(self.cobj, <const sb_symbol*>c_word, len(word))
-            length = sb_stemmer_length(self.cobj)
-            result = PyUnicode_FromStringAndSize (c_word, length)
 
         if not was_unicode:
             return result.encode(u'utf-8')
